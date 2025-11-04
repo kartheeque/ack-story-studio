@@ -1,0 +1,68 @@
+########################################
+# --- GLOBAL / OS ---
+########################################
+.DS_Store
+Thumbs.db
+
+########################################
+# --- PYTHON ---
+########################################
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+.pytest_cache/
+.python-version
+
+# Jupyter checkpoints (if any)
+.ipynb_checkpoints/
+
+########################################
+# --- NODE / JAVASCRIPT ---
+########################################
+# Node modules
+node_modules/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build artifacts (Vite)
+dist/
+build/
+
+########################################
+# --- ENV / SECRETS ---
+########################################
+# DO NOT COMMIT THESE
+.env
+*.env
+!.env.example
+
+########################################
+# --- EDITOR / IDE ---
+########################################
+.vscode/
+.idea/
+*.swp
+*.swo
+
+########################################
+# --- OUTPUT FILES ---
+########################################
+# Generated images / zips if you store them here
+*.zip
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.tmp
