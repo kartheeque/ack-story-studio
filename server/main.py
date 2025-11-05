@@ -2,11 +2,15 @@
 from dotenv import load_dotenv
 import os
 import logging
+import json
+from typing import List
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from openai import OpenAI, APIError
 import httpx
+
+from models import Panel, PromptsRequest, PromptsResponse
 
 log = logging.getLogger("uvicorn.error")
 
@@ -35,42 +39,76 @@ if not OPENAI_API_KEY:
 http_client = httpx.Client(timeout=60.0, trust_env=False)  # add proxy=... if you really need it
 client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
 
-# --- Models ---
-class PromptRequest(BaseModel):
-    story: str
-
-class PromptResponse(BaseModel):
-    prompts: list[str]
-
 # --- Health check ---
 @app.get("/health")
 def health():
     return {"ok": True}
 
 # --- Your endpoint: POST /api/prompts ---
-@app.post("/api/prompts", response_model=PromptResponse)
-def create_prompts(req: PromptRequest):
+@app.post("/api/prompts", response_model=PromptsResponse)
+def create_prompts(req: PromptsRequest):
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
     try:
-        # Keep it simple; replace with your actual prompt later
+        # Ask the model for structured JSON (background + eight panel prompts)
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
+            response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": "Return exactly 8 short image prompts."},
-                {"role": "user", "content": req.story},
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a service that extracts a concise background and exactly eight "
+                        "numbered illustration prompts from a story. "
+                        "Return strict JSON with the shape {\"background\": string, \"panels\": [" 
+                        "{\"n\": number, \"title\": string, \"prompt\": string} x8]}. "
+                        "Titles should be short and descriptive. Prompts must be richly detailed "
+                        "and self-contained.",
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Story:\n" + req.story.strip()
+                    ),
+                },
             ],
             n=1,
         )
         content = resp.choices[0].message.content or ""
-        # naive split for demo; adjust to how your prompt formats results
-        lines = [s.strip("- •\t ").strip() for s in content.split("\n") if s.strip()]
-        prompts = [l for l in lines if l][:8]
-        if len(prompts) < 8:
-            # pad to avoid FE crashing on length assumptions
-            prompts += ["(placeholder)"] * (8 - len(prompts))
-        return {"prompts": prompts}
+
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as e:
+            log.error("Model returned invalid JSON: %s", content)
+            raise HTTPException(status_code=502, detail="Model returned invalid JSON") from e
+
+        background = str(payload.get("background", "")).strip()
+        raw_panels = payload.get("panels", [])
+
+        if not isinstance(raw_panels, list):
+            raise HTTPException(status_code=502, detail="Model returned invalid panel list")
+
+        panels: List[Panel] = []
+        for idx in range(8):
+            raw = raw_panels[idx] if idx < len(raw_panels) else {}
+            if not isinstance(raw, dict):
+                raw = {}
+            n = raw.get("n", idx + 1)
+            try:
+                n = int(n)
+            except (TypeError, ValueError):
+                n = idx + 1
+            title = str(raw.get("title") or f"Panel {n}").strip()
+            prompt_text = str(raw.get("prompt") or "").strip()
+            if not prompt_text:
+                prompt_text = "(placeholder)"
+            panels.append(Panel(n=n, title=title, prompt=prompt_text))
+
+        model_used = getattr(resp, "model", "gpt-4o-mini")
+
+        return PromptsResponse(background=background, panels=panels, model=model_used)
 
     except APIError as e:
         log.exception("OpenAI API error")
