@@ -26,3 +26,5 @@ class GenerateFromBlockRequest(BaseModel):
     block: str
     image: Optional[StyleOpts] = None
     useImageReferences: bool = False
+    panelIndex: int = 1
+    previousImage: Optional[str] = None

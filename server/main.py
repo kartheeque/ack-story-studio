@@ -6,7 +6,6 @@ import json
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI, APIError
 import httpx
@@ -22,7 +21,6 @@ from utils import parse_block_to_background_and_panels
 import base64
 import io
 import re
-import zipfile
 
 log = logging.getLogger("uvicorn.error")
 
@@ -164,7 +162,7 @@ if USE_OPENAI_MOCK:
     client = MockOpenAI()
 else:
     # Build our own httpx client so the SDK doesn't construct one with deprecated args
-    http_client = httpx.Client(timeout=60.0, trust_env=False)  # add proxy=... if you really need it
+    http_client = httpx.Client(timeout=300.0, trust_env=False)  # add proxy=... if you really need it
     client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
 
 # --- Health check ---
@@ -293,59 +291,55 @@ def generate_images(req: GenerateFromBlockRequest):
     size = (req.image.size if req.image and req.image.size else "1024x1536")
     use_refs = bool(req.useImageReferences)
 
-    zip_buffer = io.BytesIO()
-    metadata = {
-        "background": background,
-        "size": size,
-        "useImageReferences": use_refs,
-        "panels": [panel.dict() for panel in panels],
-    }
+    if req.panelIndex < 1:
+        raise HTTPException(status_code=400, detail="panelIndex must be >= 1")
 
-    previous_prompt = None
-    previous_image_bytes: Optional[bytes] = None
+    if req.panelIndex > len(panels):
+        raise HTTPException(status_code=400, detail="panelIndex exceeds available prompts")
+
+    panel_position = req.panelIndex - 1
+    target_panel = panels[panel_position]
+    previous_panel = panels[panel_position - 1] if panel_position > 0 else None
+
+    prompt_parts = []
+    if background.strip():
+        prompt_parts.append(background.strip())
+    prompt_parts.append(target_panel.prompt.strip())
+    if use_refs and previous_panel:
+        prompt_parts.append(
+            "Consistency note based on previous panel: " + previous_panel.prompt.strip()
+        )
+    prompt_text = "\n\n".join(part for part in prompt_parts if part)
+
+    prompt_value = prompt_text or "Placeholder prompt"
+
+    reference_image = None
+    if use_refs and req.previousImage:
+        try:
+            reference_bytes = base64.b64decode(req.previousImage.split(",")[-1])
+            reference_image = io.BytesIO(reference_bytes)
+            reference_image.name = "previous.png"
+        except Exception as exc:  # pylint: disable=broad-except
+            raise HTTPException(status_code=400, detail="Invalid previous image data") from exc
 
     try:
-        with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("metadata.json", json.dumps(metadata, indent=2))
-
-            for idx, panel in enumerate(panels):
-                prompt_parts = []
-                if background.strip():
-                    prompt_parts.append(background.strip())
-                prompt_parts.append(panel.prompt.strip())
-                if use_refs and previous_prompt:
-                    prompt_parts.append(
-                        "Consistency note based on previous panel: " + previous_prompt.strip()
-                    )
-                prompt_text = "\n\n".join(part for part in prompt_parts if part)
-
-                prompt_value = prompt_text or "Placeholder prompt"
-
-                if use_refs and previous_image_bytes:
-                    reference_image = io.BytesIO(previous_image_bytes)
-                    reference_image.name = "previous.png"
-                    resp = client.images.edit(
-                        model="gpt-image-1",
-                        prompt=prompt_value,
-                        image=reference_image,
-                        size=size,
-                    )
-                else:
-                    resp = client.images.generate(
-                        model="gpt-image-1",
-                        prompt=prompt_value,
-                        size=size,
-                    )
-                data = getattr(resp, "data", None)
-                if not data:
-                    raise HTTPException(status_code=502, detail=f"Image {idx + 1} missing response data")
-                image_bytes = _decode_image_b64(data[0].get("b64_json"), idx)
-
-                filename = _panel_filename(panel)
-                zf.writestr(filename, image_bytes)
-
-                previous_prompt = panel.prompt
-                previous_image_bytes = image_bytes
+        if use_refs and reference_image is not None:
+            resp = client.images.edit(
+                model="gpt-image-1",
+                prompt=prompt_value,
+                image=reference_image,
+                size=size,
+            )
+        else:
+            resp = client.images.generate(
+                model="gpt-image-1",
+                prompt=prompt_value,
+                size=size,
+            )
+        data = getattr(resp, "data", None)
+        if not data:
+            raise HTTPException(status_code=502, detail="Image missing response data")
+        image_bytes = _decode_image_b64(data[0].get("b64_json"), panel_position)
     except HTTPException:
         raise
     except APIError as e:  # OpenAI specific errors
@@ -358,6 +352,14 @@ def generate_images(req: GenerateFromBlockRequest):
         log.exception("Unhandled server error during image generation")
         raise HTTPException(status_code=500, detail=f"Server error: {e}")
 
-    zip_buffer.seek(0)
-    headers = {"Content-Disposition": "attachment; filename=story_panels.zip"}
-    return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
+    encoded_image = base64.b64encode(image_bytes).decode("ascii")
+    filename = _panel_filename(target_panel)
+
+    return {
+        "filename": filename,
+        "imageBase64": encoded_image,
+        "panelIndex": target_panel.n,
+        "panelPosition": req.panelIndex,
+        "totalPanels": len(panels),
+        "size": size,
+    }
