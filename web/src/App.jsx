@@ -1,20 +1,32 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 const DEFAULT_SIZE = "1024x1536";
 
 export default function App() {
   const [story, setStory] = useState("");
-  const [block, setBlock] = useState("");       // background + 8 prompts (editable)
+  const [block, setBlock] = useState("");       // background + prompts (editable)
   const [loadingPrompts, setLoadingPrompts] = useState(false);
-  const [loadingZip, setLoadingZip] = useState(false);
   const [useRefs, setUseRefs] = useState(true);
   const [size, setSize] = useState(DEFAULT_SIZE);
-  const [panelCount, setPanelCount] = useState(0);
+  const [currentPanelPosition, setCurrentPanelPosition] = useState(1);
+  const [generatingImage, setGeneratingImage] = useState(false);
+  const [previousImageBase64, setPreviousImageBase64] = useState(null);
 
-  const countPanels = (text) => {
-    const matches = text.match(/\[PROMPT\s*\d+\]/gi);
-    return matches ? matches.length : 0;
-  };
+  const { panels } = useMemo(() => parseBlock(block), [block]);
+  const totalPanels = panels.length;
+  const nextPanel = panels[currentPanelPosition - 1] || null;
+
+  useEffect(() => {
+    if (currentPanelPosition > totalPanels + 1) {
+      setCurrentPanelPosition(totalPanels === 0 ? 1 : totalPanels + 1);
+    }
+  }, [currentPanelPosition, totalPanels]);
+
+  useEffect(() => {
+    if (!useRefs) {
+      setPreviousImageBase64(null);
+    }
+  }, [useRefs]);
 
   const onGeneratePrompts = async () => {
     const trimmed = story.trim();
@@ -36,7 +48,8 @@ export default function App() {
       const data = await res.json();
       const assembled = renderBlock(data.background, data.panels);
       setBlock(assembled);
-      setPanelCount(countPanels(assembled));
+      setCurrentPanelPosition(1);
+      setPreviousImageBase64(null);
     } catch (e) {
       alert(e.message);
     } finally {
@@ -46,19 +59,22 @@ export default function App() {
 
   const onBlockChange = (val) => {
     setBlock(val);
-    setPanelCount(countPanels(val));
   };
 
-  const onGenerateImages = async () => {
+  const onGenerateNextImage = async () => {
     const trimmed = block.trim();
     if (!trimmed) {
       alert("Right panel is empty.");
       return;
     }
-    if (panelCount !== 8) {
-      if (!confirm(`Detected ${panelCount} prompts. Continue anyway?`)) return;
+    if (!nextPanel) {
+      alert("All prompts have been generated.");
+      return;
     }
-    setLoadingZip(true);
+    if (currentPanelPosition === 1 && totalPanels !== 8) {
+      if (!confirm(`Detected ${totalPanels} prompts. Continue anyway?`)) return;
+    }
+    setGeneratingImage(true);
     try {
       const res = await fetch("/api/generate", {
         method: "POST",
@@ -66,26 +82,41 @@ export default function App() {
         body: JSON.stringify({
           block: trimmed,
           image: { size },
-          useImageReferences: useRefs
+          useImageReferences: useRefs,
+          panelIndex: currentPanelPosition,
+          previousImage: useRefs ? previousImageBase64 : null
         })
       });
       if (!res.ok) {
         const t = await res.text();
         throw new Error(t || "Failed to generate images.");
       }
-      const blob = await res.blob();
+      const data = await res.json();
+      if (!data.imageBase64) {
+        throw new Error("Image payload missing from response.");
+      }
+      const filename = data.filename || `panel-${String(currentPanelPosition).padStart(2, "0")}.png`;
+      const byteCharacters = atob(data.imageBase64);
+      const byteNumbers = new Array(byteCharacters.length);
+      for (let i = 0; i < byteCharacters.length; i += 1) {
+        byteNumbers[i] = byteCharacters.charCodeAt(i);
+      }
+      const byteArray = new Uint8Array(byteNumbers);
+      const blob = new Blob([byteArray], { type: "image/png" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "story_panels.zip";
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
+      setPreviousImageBase64(data.imageBase64);
+      setCurrentPanelPosition((prev) => prev + 1);
     } catch (e) {
       alert(e.message);
     } finally {
-      setLoadingZip(false);
+      setGeneratingImage(false);
     }
   };
 
@@ -124,7 +155,7 @@ export default function App() {
           onChange={(e)=>onBlockChange(e.target.value)}
         />
         <div style={{display:"flex", alignItems:"center", gap:"12px", marginTop:"8px"}}>
-          <span style={{fontSize:"12px"}}>Detected prompts: {panelCount}</span>
+          <span style={{fontSize:"12px"}}>Detected prompts: {totalPanels}</span>
           <label style={{display:"flex", alignItems:"center", gap:"6px"}}>
             <input type="checkbox" checked={useRefs} onChange={(e)=>setUseRefs(e.target.checked)} />
             Use previous images as references
@@ -138,11 +169,13 @@ export default function App() {
             </select>
           </label>
           <button
-            onClick={onGenerateImages}
-            disabled={!block.trim() || loadingZip}
+            onClick={onGenerateNextImage}
+            disabled={!block.trim() || generatingImage || !nextPanel}
             style={{marginLeft:"auto", padding:"8px 12px"}}
           >
-            {loadingZip ? "Generating images…" : "Generate Images (ZIP)"}
+            {generatingImage
+              ? (nextPanel ? `Generating [PROMPT ${nextPanel.n}] ${nextPanel.title}…` : "Generating image…")
+              : (nextPanel ? `Generate [PROMPT ${nextPanel.n}] ${nextPanel.title}` : "All images generated")}
           </button>
         </div>
       </div>
@@ -165,4 +198,33 @@ function renderBlock(background, panels) {
   });
 
   return parts.join("\n").trim();
+}
+
+function parseBlock(text) {
+  const lines = text.split(/\r?\n/);
+  const indices = [];
+  lines.forEach((line, idx) => {
+    const match = line.trim().match(/^\[PROMPT\s*(\d{1,2})\]\s*(.*)$/i);
+    if (match) {
+      indices.push({ index: idx, n: parseInt(match[1], 10), title: (match[2] || "").trim() });
+    }
+  });
+
+  if (indices.length === 0) {
+    return { background: text.trim(), panels: [] };
+  }
+
+  const firstIdx = indices[0].index;
+  const background = lines.slice(0, firstIdx).join("\n").trim();
+
+  const panels = indices.map((entry, idx) => {
+    const nextLine = idx + 1 < indices.length ? indices[idx + 1].index : lines.length;
+    const body = lines.slice(entry.index + 1, nextLine).join("\n").trim();
+    const title = entry.title || `Panel ${entry.n}`;
+    return { n: entry.n, title, prompt: body };
+  });
+
+  panels.sort((a, b) => a.n - b.n);
+
+  return { background, panels };
 }
