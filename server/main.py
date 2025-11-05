@@ -40,6 +40,14 @@ if not OPENAI_API_KEY and not USE_OPENAI_MOCK:
 class MockChatCompletions:
     """Mimic the subset of the OpenAI chat.completions interface we rely on."""
 
+    def __init__(self):
+        # Capture the last request so tests or debugging sessions can assert on the
+        # payload we would have sent to OpenAI without actually making a network
+        # call. This mirrors the public attributes a real client exposes when
+        # inspecting responses, giving us a convenient hook while the mock is
+        # enabled.
+        self.last_request = None
+
     class _ResponseMessage:
         def __init__(self, content: str):
             self.content = content
@@ -94,9 +102,11 @@ class MockChatCompletions:
         return json.dumps({"background": background, "panels": panels})
 
     def create(self, *, messages, **kwargs):  # pylint: disable=unused-argument
+        self.last_request = {"messages": messages, "params": dict(kwargs)}
         story = self._extract_story(messages)
         content = self._render_mock_payload(story)
-        return MockChatCompletions._Response(content, model="mock-openai")
+        model = kwargs.get("model", "mock-openai")
+        return MockChatCompletions._Response(content, model=model)
 
 
 class MockOpenAI:
