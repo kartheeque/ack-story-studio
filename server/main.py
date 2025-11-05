@@ -58,20 +58,32 @@ def create_prompts(req: PromptsRequest):
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        "You are a service that extracts a concise background and exactly eight "
-                        "numbered illustration prompts from a story. "
-                        "Return strict JSON with the shape {\"background\": string, \"panels\": [" 
-                        "{\"n\": number, \"title\": string, \"prompt\": string} x8]}. "
-                        "Titles should be short and descriptive. Prompts must be richly detailed "
-                        "and self-contained.",
-                    ),
+                    # Root cause: the new OpenAI SDK expects message content to be structured as
+                    # objects (e.g. {"type": "text", "text": "..."}). We previously sent raw
+                    # strings which triggered a 400 "Invalid type" error. Wrap the text in the
+                    # required object format so the request is accepted.
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are a service that extracts a concise background and exactly "
+                                "eight numbered illustration prompts from a story. "
+                                "Return strict JSON with the shape {\"background\": string, "
+                                "\"panels\": [{\"n\": number, \"title\": string, \"prompt\": string} x8]}. "
+                                "Titles should be short and descriptive. Prompts must be richly "
+                                "detailed and self-contained."
+                            ),
+                        }
+                    ],
                 },
                 {
                     "role": "user",
-                    "content": (
-                        "Story:\n" + req.story.strip()
-                    ),
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Story:\n" + req.story.strip(),
+                        }
+                    ],
                 },
             ],
             n=1,
