@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI, APIError
 import httpx
+import time
 
 log = logging.getLogger("uvicorn.error")
 
@@ -54,6 +55,10 @@ def create_prompts(req: PromptRequest):
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
     try:
+        log.info("Preparing to call OpenAI", extra={
+            "story_length": len(req.story or ""),
+        })
+        start_time = time.monotonic()
         # Keep it simple; replace with your actual prompt later
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -62,6 +67,17 @@ def create_prompts(req: PromptRequest):
                 {"role": "user", "content": req.story},
             ],
             n=1,
+        )
+        duration = time.monotonic() - start_time
+        log.info(
+            "OpenAI call completed",
+            extra={
+                "duration_seconds": round(duration, 3),
+                "response_id": getattr(resp, "id", None),
+                "finish_reason": resp.choices[0].finish_reason if resp.choices else None,
+                "prompt_tokens": getattr(resp, "usage", {}).prompt_tokens if getattr(resp, "usage", None) else None,
+                "completion_tokens": getattr(resp, "usage", {}).completion_tokens if getattr(resp, "usage", None) else None,
+            },
         )
         content = resp.choices[0].message.content or ""
         # naive split for demo; adjust to how your prompt formats results
@@ -73,11 +89,30 @@ def create_prompts(req: PromptRequest):
         return {"prompts": prompts}
 
     except APIError as e:
-        log.exception("OpenAI API error")
+        log.exception(
+            "OpenAI API error",
+            extra={
+                "error_type": getattr(e, "type", None),
+                "error_code": getattr(e, "code", None),
+                "error_param": getattr(e, "param", None),
+                "error_message": str(e),
+            },
+        )
         raise HTTPException(status_code=502, detail=f"Upstream OpenAI error: {e}")
     except httpx.HTTPError as e:
-        log.exception("Network error to OpenAI")
+        log.exception(
+            "Network error to OpenAI",
+            extra={
+                "error_message": str(e),
+                "request": getattr(e, "request", None).url if getattr(e, "request", None) else None,
+            },
+        )
         raise HTTPException(status_code=502, detail=f"Network error: {e}")
     except Exception as e:
-        log.exception("Unhandled server error")
+        log.exception(
+            "Unhandled server error",
+            extra={
+                "error_message": str(e),
+            },
+        )
         raise HTTPException(status_code=500, detail=f"Server error: {e}")
