@@ -339,7 +339,13 @@ def generate_images(req: GenerateFromBlockRequest):
         data = getattr(resp, "data", None)
         if not data:
             raise HTTPException(status_code=502, detail="Image missing response data")
-        image_bytes = _decode_image_b64(data[0].get("b64_json"), panel_position)
+
+        def _extract_b64(entry):
+            if isinstance(entry, dict):
+                return entry.get("b64_json")
+            return getattr(entry, "b64_json", None)
+
+        image_bytes = _decode_image_b64(_extract_b64(data[0]), panel_position)
     except HTTPException:
         raise
     except APIError as e:  # OpenAI specific errors
