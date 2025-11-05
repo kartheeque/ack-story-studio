@@ -3,14 +3,26 @@ from dotenv import load_dotenv
 import os
 import logging
 import json
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI, APIError
 import httpx
 
-from models import Panel, PromptsRequest, PromptsResponse
+from models import (
+    GenerateFromBlockRequest,
+    Panel,
+    PromptsRequest,
+    PromptsResponse,
+)
+from utils import parse_block_to_background_and_panels
+
+import base64
+import io
+import re
+import zipfile
 
 log = logging.getLogger("uvicorn.error")
 
@@ -109,9 +121,42 @@ class MockChatCompletions:
         return MockChatCompletions._Response(content, model=model)
 
 
+MOCK_PIXEL = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAAWgmWQ0AAAAASUVORK5CYII="
+)
+
+
+class MockImages:
+    """Return a single 1x1 PNG for each requested prompt."""
+
+    def __init__(self):
+        self.calls = []
+
+    class _Response:
+        def __init__(self, prompt: str):
+            payload = base64.b64encode(MOCK_PIXEL).decode("ascii")
+            self.data = [
+                {
+                    "b64_json": payload,
+                    "revised_prompt": prompt,
+                }
+            ]
+
+    def _record(self, *, prompt: str, method: str, **kwargs):
+        self.calls.append({"prompt": prompt, "method": method, "params": dict(kwargs)})
+        return MockImages._Response(prompt)
+
+    def generate(self, *, prompt: str, **kwargs):  # pylint: disable=unused-argument
+        return self._record(prompt=prompt, method="generate", **kwargs)
+
+    def edit(self, *, prompt: str, **kwargs):  # pylint: disable=unused-argument
+        return self._record(prompt=prompt, method="edit", **kwargs)
+
+
 class MockOpenAI:
     def __init__(self):
         self.chat = type("Chat", (), {"completions": MockChatCompletions()})()
+        self.images = MockImages()
 
 
 if USE_OPENAI_MOCK:
@@ -214,3 +259,105 @@ def create_prompts(req: PromptsRequest):
     except Exception as e:
         log.exception("Unhandled server error")
         raise HTTPException(status_code=500, detail=f"Server error: {e}")
+
+
+def _panel_filename(panel: Panel) -> str:
+    """Generate a filesystem-safe filename for a panel image."""
+    slug = re.sub(r"[^a-z0-9]+", "-", panel.title.strip().lower()).strip("-")
+    if not slug:
+        slug = f"panel-{panel.n}"
+    slug = slug[:40].rstrip("-")
+    return f"{panel.n:02d}-{slug}.png"
+
+
+def _decode_image_b64(payload: Optional[str], panel_index: int) -> bytes:
+    if not payload:
+        raise HTTPException(status_code=502, detail=f"Image {panel_index + 1} missing data")
+    try:
+        return base64.b64decode(payload)
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(status_code=502, detail=f"Image {panel_index + 1} decode error") from exc
+
+
+@app.post("/api/generate")
+def generate_images(req: GenerateFromBlockRequest):
+    if not OPENAI_API_KEY and not USE_OPENAI_MOCK:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
+
+    background, parsed_panels = parse_block_to_background_and_panels(req.block or "")
+    if not parsed_panels:
+        raise HTTPException(status_code=400, detail="No [PROMPT N] sections found in block")
+
+    # Only keep the first eight prompts; ignore extras to avoid runaway usage.
+    panels = sorted(parsed_panels, key=lambda p: p.n)[:8]
+    size = (req.image.size if req.image and req.image.size else "1024x1536")
+    use_refs = bool(req.useImageReferences)
+
+    zip_buffer = io.BytesIO()
+    metadata = {
+        "background": background,
+        "size": size,
+        "useImageReferences": use_refs,
+        "panels": [panel.dict() for panel in panels],
+    }
+
+    previous_prompt = None
+    previous_image_bytes: Optional[bytes] = None
+
+    try:
+        with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("metadata.json", json.dumps(metadata, indent=2))
+
+            for idx, panel in enumerate(panels):
+                prompt_parts = []
+                if background.strip():
+                    prompt_parts.append(background.strip())
+                prompt_parts.append(panel.prompt.strip())
+                if use_refs and previous_prompt:
+                    prompt_parts.append(
+                        "Consistency note based on previous panel: " + previous_prompt.strip()
+                    )
+                prompt_text = "\n\n".join(part for part in prompt_parts if part)
+
+                prompt_value = prompt_text or "Placeholder prompt"
+
+                if use_refs and previous_image_bytes:
+                    reference_image = io.BytesIO(previous_image_bytes)
+                    reference_image.name = "previous.png"
+                    resp = client.images.edit(
+                        model="gpt-image-1",
+                        prompt=prompt_value,
+                        image=reference_image,
+                        size=size,
+                    )
+                else:
+                    resp = client.images.generate(
+                        model="gpt-image-1",
+                        prompt=prompt_value,
+                        size=size,
+                    )
+                data = getattr(resp, "data", None)
+                if not data:
+                    raise HTTPException(status_code=502, detail=f"Image {idx + 1} missing response data")
+                image_bytes = _decode_image_b64(data[0].get("b64_json"), idx)
+
+                filename = _panel_filename(panel)
+                zf.writestr(filename, image_bytes)
+
+                previous_prompt = panel.prompt
+                previous_image_bytes = image_bytes
+    except HTTPException:
+        raise
+    except APIError as e:  # OpenAI specific errors
+        log.exception("OpenAI image generation error")
+        raise HTTPException(status_code=502, detail=f"Upstream OpenAI error: {e}")
+    except httpx.HTTPError as e:
+        log.exception("Network error to OpenAI during image generation")
+        raise HTTPException(status_code=502, detail=f"Network error: {e}")
+    except Exception as e:  # pylint: disable=broad-except
+        log.exception("Unhandled server error during image generation")
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
+
+    zip_buffer.seek(0)
+    headers = {"Content-Disposition": "attachment; filename=story_panels.zip"}
+    return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
