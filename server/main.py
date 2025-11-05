@@ -17,6 +17,7 @@ log = logging.getLogger("uvicorn.error")
 #Load .env
 load_dotenv()  # <--- this reads .env automatically
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+USE_OPENAI_MOCK = os.getenv("OPENAI_USE_MOCK", "0").lower() in {"1", "true", "yes", "on"}
 
 # --- FastAPI app ---
 app = FastAPI()
@@ -32,12 +33,84 @@ app.add_middleware(
 )
 
 # --- OpenAI client ---
-if not OPENAI_API_KEY:
+if not OPENAI_API_KEY and not USE_OPENAI_MOCK:
     log.warning("OPENAI_API_KEY is not set in the environment.")
 
-# Build our own httpx client so the SDK doesn't construct one with deprecated args
-http_client = httpx.Client(timeout=60.0, trust_env=False)  # add proxy=... if you really need it
-client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+
+class MockChatCompletions:
+    """Mimic the subset of the OpenAI chat.completions interface we rely on."""
+
+    class _ResponseMessage:
+        def __init__(self, content: str):
+            self.content = content
+
+    class _ResponseChoice:
+        def __init__(self, content: str):
+            self.message = MockChatCompletions._ResponseMessage(content)
+
+    class _Response:
+        def __init__(self, content: str, model: str):
+            self.choices = [MockChatCompletions._ResponseChoice(content)]
+            self.model = model
+
+    @staticmethod
+    def _extract_story(messages):
+        story_chunks = []
+        for message in messages:
+            if message.get("role") != "user":
+                continue
+            for chunk in message.get("content", []):
+                if isinstance(chunk, dict) and chunk.get("type") == "text":
+                    story_chunks.append(str(chunk.get("text", "")))
+        combined = "\n".join(story_chunks).strip()
+        if combined.lower().startswith("story:"):
+            combined = combined.split(":", 1)[1].strip()
+        return combined or "Mock story content"
+
+    @staticmethod
+    def _render_mock_payload(story: str) -> str:
+        sentences = [s.strip() for s in story.replace("\n", " ").split(".") if s.strip()]
+        if not sentences:
+            sentences = ["A placeholder scene for the mock story"]
+
+        background = " ".join(sentences[:2]).strip()
+        if not background:
+            background = "Mock background generated from the provided story."
+
+        panels = []
+        for idx in range(8):
+            source_sentence = sentences[idx % len(sentences)]
+            panels.append(
+                {
+                    "n": idx + 1,
+                    "title": f"Panel {idx + 1}",
+                    "prompt": (
+                        f"Mock prompt {idx + 1}: illustrate '{source_sentence}' with vivid colors, "
+                        "dynamic lighting, and cinematic composition."
+                    ),
+                }
+            )
+
+        return json.dumps({"background": background, "panels": panels})
+
+    def create(self, *, messages, **kwargs):  # pylint: disable=unused-argument
+        story = self._extract_story(messages)
+        content = self._render_mock_payload(story)
+        return MockChatCompletions._Response(content, model="mock-openai")
+
+
+class MockOpenAI:
+    def __init__(self):
+        self.chat = type("Chat", (), {"completions": MockChatCompletions()})()
+
+
+if USE_OPENAI_MOCK:
+    log.info("OPENAI_USE_MOCK enabled; returning mock completions instead of hitting OpenAI.")
+    client = MockOpenAI()
+else:
+    # Build our own httpx client so the SDK doesn't construct one with deprecated args
+    http_client = httpx.Client(timeout=60.0, trust_env=False)  # add proxy=... if you really need it
+    client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
 
 # --- Health check ---
 @app.get("/health")
@@ -47,7 +120,7 @@ def health():
 # --- Your endpoint: POST /api/prompts ---
 @app.post("/api/prompts", response_model=PromptsResponse)
 def create_prompts(req: PromptsRequest):
-    if not OPENAI_API_KEY:
+    if not OPENAI_API_KEY and not USE_OPENAI_MOCK:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
     try:

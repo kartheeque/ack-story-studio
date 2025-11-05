@@ -20,3 +20,7 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+2. To run the API without hitting OpenAI, export `OPENAI_USE_MOCK=1`. The server will return deterministic
+   mock responses so you can debug parsing and UI logic without spending tokens. Unset or set to `0` to restore
+   the real OpenAI client.
